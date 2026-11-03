@@ -265,6 +265,17 @@ const STATUS_MP = {
 	in_process: "aguardando",
 	pending: "aguardando"
 };
+const CAMPOS_PAGAMENTO = [
+	"pag_pix_online",
+	"pag_cartao_online",
+	"pag_entrega",
+	"pag_whatsapp",
+	"entrega_dinheiro",
+	"entrega_cartao",
+	"entrega_pix",
+	"cartao_parcelas",
+	"pix_minutos"
+];
 /** Texto curto do pagamento de um pedido, ex.: "Pix online · pago" ou "Na entrega: Dinheiro (troco para R$ 100,00)". */
 function descreverPagamento(p) {
 	const modo = p.pagamento_modo ?? "whatsapp";
@@ -285,6 +296,26 @@ const cpfValido = (c) => {
 	};
 	return dv(9) === Number(d[9]) && dv(10) === Number(d[10]);
 };
+const LIMITES = {
+	fotos: 10,
+	videos: 3,
+	bytesFoto: 9e5,
+	bytesVideo: 41943040
+};
+const CAMPOS_CONFIG = [
+	"whatsapp",
+	"instagram",
+	"email",
+	"endereco",
+	"cidade",
+	"horario",
+	"aviso_topo",
+	"titulo_destaque",
+	"texto_destaque",
+	"entrega_texto",
+	"aceita_entrega",
+	"pedido_minimo"
+];
 const emailValido = (e) => /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(String(e ?? ""));
 const txt = (v) => v === null || v === void 0 ? null : String(v).trim() || null;
 const digitos = (v) => String(v ?? "").replace(/\D/g, "");
@@ -297,6 +328,85 @@ const moeda = (n) => Number(n).toLocaleString("pt-BR", {
 	currency: "BRL"
 }).replace(/ /g, " ");
 const qtdTexto = (q) => Number(q).toLocaleString("pt-BR", { maximumFractionDigits: 3 });
+/** "1.234,56", "1234.56" ou número → número (ou NaN). */
+const lerValor = (v) => typeof v === "number" ? v : Number(String(v ?? "").trim().replace(/\.(?=\d{3}(\D|$))/g, "").replace(",", "."));
+/** Textos e contato do site, já conferidos: devolve só os campos enviados. */
+function normalizarConfig(d = {}) {
+	const campos = CAMPOS_CONFIG.filter((c) => c in d);
+	exigir(campos.length, "Nada para salvar.");
+	if ("whatsapp" in d && txt(d.whatsapp)) {
+		const w = digitos(d.whatsapp);
+		exigir(w.length >= 10 && w.length <= 13, "O WhatsApp precisa ter DDD + número, ex.: (82) 99999-9999.");
+	}
+	if ("email" in d && txt(d.email)) exigir(emailValido(txt(d.email)), "E-mail inválido.");
+	return Object.fromEntries(campos.map((c) => {
+		if (c === "pedido_minimo") return [c, Math.max(0, r2(lerValor(d[c] ?? 0)) || 0)];
+		if (c === "aceita_entrega") return [c, !!d[c]];
+		return [c, typeof d[c] === "string" ? txt(d[c])?.slice(0, 600) ?? null : d[c] ?? null];
+	}));
+}
+/** Formas de pagamento do site, conferidas. atual: config de hoje · mpConectado: undefined = não confere o Mercado Pago. */
+function normalizarPagamentos(atual, d = {}, { mpConectado } = {}) {
+	const novo = {
+		...Object.fromEntries(CAMPOS_PAGAMENTO.map((c) => [c, atual[c]])),
+		...Object.fromEntries(CAMPOS_PAGAMENTO.filter((c) => c in d).map((c) => [c, d[c]]))
+	};
+	for (const c of CAMPOS_PAGAMENTO.filter((x) => x.startsWith("pag_") || x.startsWith("entrega_"))) novo[c] = !!novo[c];
+	novo.cartao_parcelas = Math.round(Number(novo.cartao_parcelas));
+	exigir(novo.cartao_parcelas >= 1 && novo.cartao_parcelas <= 12, "Parcelas: de 1 a 12.");
+	novo.pix_minutos = Math.round(Number(novo.pix_minutos));
+	exigir(novo.pix_minutos >= 30 && novo.pix_minutos <= 1440, "Validade do Pix: de 30 minutos a 24 horas.");
+	if (mpConectado === false && (novo.pag_pix_online && !atual.pag_pix_online || novo.pag_cartao_online && !atual.pag_cartao_online)) exigir(false, "Conecte o Mercado Pago antes (no caixa: Configurações › Mercado Pago › Access Token).");
+	exigir(novo.pag_pix_online || novo.pag_cartao_online || novo.pag_entrega || novo.pag_whatsapp, "Deixe pelo menos uma forma de pagamento ligada.");
+	exigir(!novo.pag_entrega || novo.entrega_dinheiro || novo.entrega_cartao || novo.entrega_pix, "Em \"Pagar na entrega\", marque pelo menos dinheiro, cartão ou Pix.");
+	return novo;
+}
+/** Produto na vitrine (o que dá para mudar pelo site): visível, destaque, preço e descrição. */
+function normalizarProduto(d = {}) {
+	const r = {};
+	if ("site_visivel" in d) r.site_visivel = !!d.site_visivel;
+	if ("site_destaque" in d) r.site_destaque = !!d.site_destaque;
+	if ("preco_venda" in d) {
+		const p = r2(lerValor(d.preco_venda));
+		exigir(Number.isFinite(p) && p > 0 && p < 1e7, "Informe um preço maior que zero.");
+		r.preco_venda = p;
+	}
+	if ("descricao" in d) r.descricao = txt(d.descricao)?.slice(0, 1200) ?? null;
+	exigir(Object.keys(r).length, "Nada para salvar.");
+	return r;
+}
+/** Mesmas formas do fluxo de caixa do programa. */
+const FORMAS_LANCAMENTO = {
+	dinheiro: "Dinheiro",
+	pix: "Pix",
+	cartao_credito: "Crédito",
+	cartao_debito: "Débito",
+	boleto: "Boleto",
+	outros: "Outros"
+};
+/** Lançamento avulso no fluxo de caixa (entrada ou saída), conferido. */
+function normalizarLancamento(d = {}) {
+	exigir(["entrada", "saida"].includes(d.tipo), "Escolha se é entrada ou saída.");
+	const descricao = txt(d.descricao)?.slice(0, 120);
+	exigir(descricao, "Descreva o lançamento.");
+	const valor = r2(lerValor(d.valor));
+	exigir(Number.isFinite(valor) && valor > 0 && valor < 1e8, "Informe um valor maior que zero.");
+	const data = txt(d.data);
+	exigir(!data || /^\d{4}-\d{2}-\d{2}$/.test(data) && !Number.isNaN(Date.parse(data)), "Data inválida.");
+	const forma = txt(d.forma);
+	exigir(!forma || forma in FORMAS_LANCAMENTO, "Forma de pagamento inválida.");
+	const cat = txt(d.categoria_id);
+	exigir(!cat || /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(cat), "Categoria inválida.");
+	return {
+		tipo: d.tipo,
+		descricao,
+		valor,
+		data,
+		forma,
+		categoria_id: cat,
+		observacao: txt(d.observacao)?.slice(0, 300) ?? null
+	};
+}
 function linkWhatsapp(numero, texto) {
 	let d = digitos(numero);
 	if (d && !(d.startsWith("55") && d.length >= 12)) d = "55" + d;
@@ -959,6 +1069,12 @@ function criarLojaNuvem({ db, mp, armazenamento, urls = {}, conferirSenha = asyn
 	const listaPedidos = `select p.id, p.numero::int as numero, p.created_at, p.cliente_nome, p.telefone, p.entrega, p.status, p.subtotal::float8 as subtotal,
       p.pagamento_modo, p.pagamento_status, p.pagamento, p.troco_para, p.pago_forma, p.pago_parcelas, p.venda_numero,
       (select count(*)::int from pedido_site_itens i where i.pedido_id = p.id) as qtd_itens from pedidos_site p`;
+	const soDono = (s) => exigir(s.papel === "dono", "Só o dono da loja pode ver e mudar isso.");
+	const enfileirar = (tipo, dados, por) => linha("insert into alteracoes_web (tipo, dados, por) values ($1, $2::jsonb, $3) returning id, criado_em", [
+		tipo,
+		JSON.stringify(dados),
+		por
+	]);
 	const admin = {
 		"admin.eu": async (_d, s) => ({
 			nome: s.nome,
@@ -1006,6 +1122,167 @@ function criarLojaNuvem({ db, mp, armazenamento, urls = {}, conferirSenha = asyn
 			else exigir(status === SEGUINTE[p.status], "Atualize a página: o pedido mudou.");
 			await aplicarStatus(p, status, s.nome, null);
 			return admin["admin.pedido"]({ id });
+		},
+		"admin.financeiro": async (_d, s) => {
+			soDono(s);
+			const f = await linha("select dados, atualizado_em from financeiro_web where id = 1");
+			const fila = await linhas(`select id, criado_em, por, tipo, dados, situacao, erro from alteracoes_web
+        where tipo in ('lancamento', 'lancamento_excluir') and (situacao = 'pendente' or (situacao = 'recusada' and criado_em > now() - interval '3 days'))
+        order by criado_em desc limit 100`);
+			const excluindo = new Set(fila.filter((a) => a.tipo === "lancamento_excluir" && a.situacao === "pendente").map((a) => a.dados.id));
+			return {
+				...f?.dados ?? {},
+				recebido_em: f?.atualizado_em ?? null,
+				tem_dados: !!f?.dados?.gerado_em,
+				excluindo: [...excluindo],
+				pendentes: fila.filter((a) => a.tipo === "lancamento" && !excluindo.has(a.id)).map((a) => ({
+					id: a.id,
+					...a.dados,
+					por: a.por,
+					criado_em: a.criado_em,
+					situacao: a.situacao,
+					erro: a.erro
+				}))
+			};
+		},
+		"admin.lancar": async (d, s) => {
+			soDono(s);
+			const l = normalizarLancamento(d);
+			return {
+				id: (await enfileirar("lancamento", l, s.nome)).id,
+				...l
+			};
+		},
+		/** Exclui um lançamento avulso (os de vendas e contas mudam pela venda ou conta, no caixa). */
+		"admin.excluirLancamento": async ({ id }, s) => {
+			soDono(s);
+			exigir(UUID.test(id ?? ""), "Lançamento inválido.");
+			const doCaixa = ((await linha("select dados from financeiro_web where id = 1"))?.dados?.lancamentos ?? []).find((l) => l.id === id);
+			const naFila = await linha(`select 1 from alteracoes_web where id = $1 and tipo = 'lancamento' and situacao = 'pendente'`, [id]);
+			exigir(doCaixa || naFila, "Lançamento não encontrado. Atualize a página.");
+			exigir(!doCaixa || doCaixa.origem === "manual", "Lançamentos de vendas e de contas são desfeitos no caixa, pela própria venda ou conta.");
+			await enfileirar("lancamento_excluir", { id }, s.nome);
+			return true;
+		},
+		"admin.vitrine": async (_d, s) => {
+			soDono(s);
+			return linhas(`select p.id, p.codigo, p.nome, p.marca, p.descricao, p.preco_venda::float8 as preco, p.unidade, p.estoque_atual::float8 as estoque,
+          p.categoria_id, c.nome as categoria, p.site_visivel, p.site_destaque, p.imagem, p.ilustracao,
+          (select count(*)::int from produto_midias m where m.produto_id = p.id and m.tipo = 'foto') as qtd_fotos,
+          exists (select 1 from alteracoes_web a where a.situacao = 'pendente' and a.dados->>'produto_id' = p.id::text) as pendente
+        from produtos p left join categorias_produto c on c.id = p.categoria_id
+        where p.ativo order by c.nome nulls last, p.nome`);
+		},
+		"admin.produto": async ({ id }, s) => {
+			soDono(s);
+			exigir(UUID.test(id ?? ""), "Produto inválido.");
+			const p = await linha(`select p.id, p.codigo, p.nome, p.marca, p.descricao, p.preco_venda::float8 as preco, p.unidade, p.estoque_atual::float8 as estoque,
+          c.nome as categoria, p.site_visivel, p.site_destaque, p.imagem, p.ilustracao
+        from produtos p left join categorias_produto c on c.id = p.categoria_id where p.id = $1 and p.ativo`, [id]);
+			exigir(p, "Produto não encontrado.");
+			const midias = await linhas("select id, tipo, conteudo, ordem from produto_midias where produto_id = $1 order by ordem", [id]);
+			const pendente = !!await linha(`select 1 from alteracoes_web where situacao = 'pendente' and dados->>'produto_id' = $1`, [id]);
+			return {
+				...p,
+				midias,
+				pendente,
+				limite_fotos: LIMITES.fotos
+			};
+		},
+		"admin.salvarProduto": async (d, s) => {
+			soDono(s);
+			exigir(UUID.test(d.id ?? ""), "Produto inválido.");
+			exigir(await linha("select 1 from produtos where id = $1 and ativo", [d.id]), "Produto não encontrado.");
+			const campos = normalizarProduto(d);
+			const cols = Object.keys(campos);
+			await linhas(`update produtos set ${cols.map((c, i) => `${c} = $${i + 2}`).join(", ")}, updated_at = now() where id = $1`, [d.id, ...cols.map((c) => campos[c])]);
+			await enfileirar("produto", {
+				produto_id: d.id,
+				...campos
+			}, s.nome);
+			return admin["admin.produto"]({ id: d.id }, s);
+		},
+		/** Foto tirada ou escolhida no celular (já reduzida pelo navegador): vai para o site e para o caixa. */
+		"admin.fotoAdicionar": async ({ produto_id, conteudo }, s) => {
+			soDono(s);
+			exigir(UUID.test(produto_id ?? ""), "Produto inválido.");
+			exigir(await linha("select 1 from produtos where id = $1 and ativo", [produto_id]), "Produto não encontrado.");
+			const m = /^data:(image\/(?:jpeg|png|webp));base64,([A-Za-z0-9+/=]+)$/.exec(String(conteudo ?? ""));
+			exigir(m && conteudo.length < LIMITES.bytesFoto, "Foto inválida ou grande demais.");
+			const n = await linha(`select count(*) filter (where tipo = 'foto')::int as fotos, coalesce(max(ordem), -1)::int as ultima from produto_midias where produto_id = $1`, [produto_id]);
+			exigir(n.fotos < LIMITES.fotos, `No máximo ${LIMITES.fotos} fotos por produto.`);
+			exigir(armazenamento.enviar, "Envio de fotos indisponível no momento.");
+			const id = crypto.randomUUID();
+			const bin = atob(m[2]);
+			const bytes = new Uint8Array(bin.length);
+			for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+			const url = await armazenamento.enviar(`produtos/${produto_id}/${id}.${EXT[m[1]]}`, m[1], bytes);
+			await db.transaction(async (t) => {
+				await t.query(`insert into produto_midias (id, produto_id, tipo, ordem, conteudo, mime, nome, tamanho) values ($1, $2, 'foto', $3, $4, $5, 'foto do celular', $6)`, [
+					id,
+					produto_id,
+					n.ultima + 1,
+					url,
+					m[1],
+					bytes.length
+				]);
+				await t.query(`update produtos set imagem = (select conteudo from produto_midias where produto_id = $1 and tipo = 'foto' order by ordem limit 1), updated_at = now() where id = $1`, [produto_id]);
+			});
+			await enfileirar("foto_adicionar", {
+				produto_id,
+				id,
+				url,
+				mime: m[1],
+				conteudo
+			}, s.nome);
+			return admin["admin.produto"]({ id: produto_id }, s);
+		},
+		/** Nova ordem da galeria (a primeira foto vira a capa); o que não vier na lista sai. */
+		"admin.fotosOrdem": async ({ produto_id, ids }, s) => {
+			soDono(s);
+			exigir(UUID.test(produto_id ?? "") && Array.isArray(ids), "Pedido inválido.");
+			const atuais = await linhas("select id, tipo, conteudo from produto_midias where produto_id = $1", [produto_id]);
+			const conhecidos = new Set(atuais.map((m) => m.id));
+			exigir(ids.every((x) => conhecidos.has(x)) && new Set(ids).size === ids.length, "A galeria mudou. Abra o produto de novo.");
+			const sair = atuais.filter((m) => !ids.includes(m.id));
+			await db.transaction(async (t) => {
+				await t.query("delete from produto_midias where produto_id = $1 and not (id = any($2::uuid[]))", [produto_id, ids]);
+				for (const [ordem, id] of ids.entries()) await t.query("update produto_midias set ordem = $2 where id = $1", [id, ordem]);
+				await t.query(`update produtos set imagem = (select conteudo from produto_midias where produto_id = $1 and tipo = 'foto' order by ordem limit 1), updated_at = now() where id = $1`, [produto_id]);
+			});
+			const apagar = sair.filter((m) => m.tipo !== "link").map((m) => m.conteudo).filter(Boolean);
+			if (apagar.length) await armazenamento.apagar?.(apagar).catch(() => {});
+			await enfileirar("fotos_ordem", {
+				produto_id,
+				ids
+			}, s.nome);
+			return admin["admin.produto"]({ id: produto_id }, s);
+		},
+		"admin.site": async (_d, s) => {
+			soDono(s);
+			const c = await linha("select * from site_config where id = 1");
+			const mpConectado = !!await linha(`select 1 from segredos where nome = 'mp_token'`);
+			const pendente = !!await linha(`select 1 from alteracoes_web where situacao = 'pendente' and tipo in ('site', 'pagamentos')`);
+			return {
+				config: Object.fromEntries([...CAMPOS_CONFIG, ...CAMPOS_PAGAMENTO].map((k) => [k, k === "pedido_minimo" ? Number(c[k]) : c[k]])),
+				mp_conectado: mpConectado,
+				pendente
+			};
+		},
+		"admin.salvarSite": async (d, s) => {
+			soDono(s);
+			const novo = normalizarConfig(d);
+			const cols = Object.keys(novo);
+			await linhas(`update site_config set ${cols.map((c, i) => `${c} = $${i + 1}`).join(", ")}, updated_at = now() where id = 1`, cols.map((c) => novo[c]));
+			await enfileirar("site", novo, s.nome);
+			return admin["admin.site"]({}, s);
+		},
+		"admin.salvarPagamentos": async (d, s) => {
+			soDono(s);
+			const novo = normalizarPagamentos(await linha("select * from site_config where id = 1"), d, { mpConectado: !!await linha(`select 1 from segredos where nome = 'mp_token'`) });
+			await linhas(`update site_config set ${CAMPOS_PAGAMENTO.map((c, i) => `${c} = $${i + 1}`).join(", ")}, updated_at = now() where id = 1`, CAMPOS_PAGAMENTO.map((c) => novo[c]));
+			await enfileirar("pagamentos", novo, s.nome);
+			return admin["admin.site"]({}, s);
 		}
 	};
 	const caixa = {
@@ -1019,13 +1296,16 @@ function criarLojaNuvem({ db, mp, armazenamento, urls = {}, conferirSenha = asyn
 				mp_conta: e.mp_conta,
 				versao: v.versao,
 				pedidos_novos: v.novos,
-				produtos: p.n
+				produtos: p.n,
+				alteracoes: (await linha(`select count(*)::int as n from alteracoes_web where situacao = 'pendente'`)).n
 			};
 		},
 		/** Recebe do caixa: dados da empresa, textos/pagamentos do site, departamentos e produtos (só os que mudaram). */
-		"caixa.publicar": async ({ empresa, site, categorias, produtos, produtos_ids, usuarios }) => {
+		"caixa.publicar": async ({ empresa, site, categorias, produtos, produtos_ids, usuarios, financeiro }) => {
 			await db.transaction(async (t) => {
 				const q = (s, p) => t.query(s, p);
+				if (financeiro && typeof financeiro === "object") await q(`insert into financeiro_web (id, dados, atualizado_em) values (1, $1::jsonb, now())
+            on conflict (id) do update set dados = excluded.dados, atualizado_em = now()`, [JSON.stringify(financeiro)]);
 				if (Array.isArray(usuarios)) {
 					for (const u of usuarios) {
 						if (!txt(u.login) || !/^scrypt\$[0-9a-f]+\$[0-9a-f]+$/.test(u.senha_hash ?? "")) continue;
@@ -1153,6 +1433,22 @@ function criarLojaNuvem({ db, mp, armazenamento, urls = {}, conferirSenha = asyn
 			exigir(p, "Pedido não encontrado no site.");
 			await loja.conferirPagamento(p);
 			return pedidoCompleto(await linha("select *, versao::text as versao, numero::int as numero from pedidos_site where id = $1", [id]));
+		},
+		/** O que a dona mudou pelo site e o caixa ainda não aplicou (na ordem em que foi feito). */
+		"caixa.alteracoes": async ({ limite = 100 } = {}) => linhas(`select id, criado_em, por, tipo, dados from alteracoes_web where situacao = 'pendente'
+      order by criado_em, id limit $1`, [Math.min(300, Math.max(1, Number(limite) || 100))]),
+		/** O caixa conta o que aplicou (ou recusou, com o motivo). */
+		"caixa.alteracoesFeitas": async ({ resultados = [] } = {}) => {
+			for (const r of resultados) {
+				if (!UUID.test(r.id ?? "")) continue;
+				await linhas(`update alteracoes_web set situacao = $2, erro = $3, aplicada_em = now(), dados = dados - 'conteudo' where id = $1 and situacao = 'pendente'`, [
+					r.id,
+					r.ok ? "aplicada" : "recusada",
+					r.ok ? null : txt(r.erro)?.slice(0, 300) ?? "recusado pelo caixa"
+				]);
+			}
+			await linhas(`delete from alteracoes_web where situacao <> 'pendente' and criado_em < now() - interval '30 days'`);
+			return true;
 		},
 		/** Access Token do Mercado Pago da loja (só o servidor usa; nunca vai para o site). */
 		"caixa.segredo": async ({ nome, valor, conta, ambiente }) => {
@@ -1356,6 +1652,24 @@ function armazenamentoSupabase({ url, chaveServico, pasta = "midias", enviar = f
 				},
 				url_publica: `${url}/storage/v1/object/public/${pasta}/${caminho}`
 			};
+		},
+		/** Envia o arquivo daqui mesmo (fotos tiradas no celular pelo admin do site). Devolve o endereço público. */
+		async enviar(caminho, mime, bytes) {
+			const r = await enviar(`${url}/storage/v1/object/${pasta}/${caminho}`, {
+				method: "POST",
+				headers: {
+					...cab,
+					"Content-Type": mime,
+					"x-upsert": "true",
+					"cache-control": "max-age=31536000"
+				},
+				body: bytes
+			});
+			if (!r.ok) {
+				const d = await r.json().catch(() => ({}));
+				throw new Error(`armazenamento: ${d.message ?? d.error ?? r.status}`);
+			}
+			return `${url}/storage/v1/object/public/${pasta}/${caminho}`;
 		},
 		async apagar(urls) {
 			const prefixo = `${url}/storage/v1/object/public/${pasta}/`;
