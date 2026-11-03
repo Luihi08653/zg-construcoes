@@ -882,7 +882,8 @@ async function sha256(texto) {
 * db: { query, transaction } · mp: cliente do Mercado Pago · armazenamento: { assinarEnvio(caminho, mime), apagar(caminhos) }
 * urls: { notificacao, voltar } — avisos do Mercado Pago e volta do cliente depois do cartão.
 */
-function criarLojaNuvem({ db, mp, armazenamento, urls = {} }) {
+/** conferirSenha(senha, hash) → boolean: confere a senha do caixa (scrypt), vinda de quem chama (Node/Deno). */
+function criarLojaNuvem({ db, mp, armazenamento, urls = {}, conferirSenha = async () => false }) {
 	const linhas = async (sql, p) => (await db.query(sql, p)).rows;
 	const linha = async (sql, p) => (await linhas(sql, p))[0] ?? null;
 	let autor = "site";
@@ -913,6 +914,100 @@ function criarLojaNuvem({ db, mp, armazenamento, urls = {} }) {
 		pagamentos: await linhas(`select id, tipo, valor::float8 as valor, status, created_at, pago_em, parcelas, bandeira, forma, ambiente, mp_id, referencia
       from pagamentos_site where pedido_id = $1 order by created_at`, [p.id])
 	});
+	async function aplicarStatus(p, status, por, nota) {
+		exigir([
+			"novo",
+			"confirmado",
+			"separando",
+			"pronto",
+			"entregue",
+			"cancelado"
+		].includes(status), "Situação inválida.");
+		autor = por;
+		try {
+			if (status === "cancelado") {
+				for (const ant of await linhas(`select * from pagamentos_site where pedido_id = $1 and status = 'aguardando'`, [p.id])) {
+					if (ant.tipo === "pix" && ant.mp_id) await mp.cancelar(ant.mp_id).catch(() => null);
+					await linhas(`update pagamentos_site set status = 'cancelado' where id = $1`, [ant.id]);
+				}
+				if (p.pagamento_status === "aguardando") await linhas(`update pedidos_site set pagamento_status = 'cancelado' where id = $1`, [p.id]);
+			}
+			await loja.mudarStatus(p, status, txt(nota) ?? (status === "cancelado" && p.pagamento_status === "pago" ? "já estava pago online: devolva o valor pelo Mercado Pago" : void 0));
+		} finally {
+			autor = "site";
+		}
+	}
+	const SEGUINTE = {
+		novo: "confirmado",
+		confirmado: "separando",
+		separando: "pronto",
+		pronto: "entregue"
+	};
+	const SESSAO_DIAS = 30;
+	function tokenNovo() {
+		const b = /* @__PURE__ */ new Uint8Array(32);
+		crypto.getRandomValues(b);
+		return btoa(String.fromCharCode(...b)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+	}
+	async function sessaoDe(token) {
+		if (!token || String(token).length < 30) return null;
+		const s = await linha(`select s.login, u.nome, u.papel from sessoes_web s join usuarios_web u on u.login = s.login and u.ativo
+      where s.token_hash = $1 and s.expira > now()`, [await sha256(token)]);
+		if (s) await linhas(`update sessoes_web set ultimo_uso = now(), expira = now() + ($2::int * interval '1 day') where token_hash = $1`, [await sha256(token), SESSAO_DIAS]);
+		return s;
+	}
+	const listaPedidos = `select p.id, p.numero::int as numero, p.created_at, p.cliente_nome, p.telefone, p.entrega, p.status, p.subtotal::float8 as subtotal,
+      p.pagamento_modo, p.pagamento_status, p.pagamento, p.troco_para, p.pago_forma, p.pago_parcelas, p.venda_numero,
+      (select count(*)::int from pedido_site_itens i where i.pedido_id = p.id) as qtd_itens from pedidos_site p`;
+	const admin = {
+		"admin.eu": async (_d, s) => ({
+			nome: s.nome,
+			papel: s.papel,
+			loja: (await linha("select nome_fantasia from empresa where id = 1")).nome_fantasia
+		}),
+		"admin.sair": async (_d, _s, token) => {
+			await linhas("delete from sessoes_web where token_hash = $1", [await sha256(token)]);
+			return true;
+		},
+		"admin.resumo": async () => linha(`select count(*) filter (where status = 'novo')::int as novos,
+        count(*) filter (where status not in ('entregue', 'cancelado'))::int as abertos,
+        coalesce(sum(subtotal) filter (where pagamento_status = 'pago' and pago_em >= date_trunc('day', now() at time zone 'America/Maceio') at time zone 'America/Maceio'), 0)::float8 as pago_hoje,
+        count(*) filter (where created_at >= date_trunc('day', now() at time zone 'America/Maceio') at time zone 'America/Maceio')::int as hoje
+      from pedidos_site`),
+		"admin.pedidos": async ({ status = "abertos", busca } = {}) => {
+			const termo = txt(busca) ? `%${txt(busca).toLowerCase()}%` : null;
+			return (await linhas(`${listaPedidos}
+        where case $1 when 'abertos' then p.status not in ('entregue', 'cancelado') when 'todos' then true else p.status = $1 end
+          and ($2::text is null or lower(p.cliente_nome) like $2 or p.telefone like $2 or p.numero::text like $2)
+        order by case when p.status = 'novo' then 0 else 1 end, p.created_at desc limit 300`, [status, termo])).map((p) => ({
+				...p,
+				pagamento_descricao: descreverPagamento(p)
+			}));
+		},
+		"admin.pedido": async ({ id }) => {
+			const p0 = await linha("select * from pedidos_site where id = $1", [id]);
+			exigir(p0, "Pedido não encontrado.");
+			if (p0.pagamento_status === "aguardando") await loja.conferirPagamento(p0).catch(() => null);
+			const p = await linha("select *, numero::int as numero, subtotal::float8 as subtotal from pedidos_site where id = $1", [id]);
+			const c = await pedidoCompleto(p);
+			const loja_ = (await linha("select nome_fantasia from empresa where id = 1")).nome_fantasia;
+			return {
+				...c,
+				pagamento_descricao: descreverPagamento(p),
+				proximo: SEGUINTE[p.status] ?? null,
+				whatsapp: linkWhatsapp(p.telefone, `Olá, ${String(p.cliente_nome).split(" ")[0]}! Aqui é da ${loja_}, sobre o seu pedido nº ${p.numero}: `)
+			};
+		},
+		"admin.status": async ({ id, status }, s) => {
+			const p = await linha("select * from pedidos_site where id = $1", [id]);
+			exigir(p, "Pedido não encontrado.");
+			exigir(!["entregue", "cancelado"].includes(p.status), "Este pedido já foi encerrado.");
+			if (status === "cancelado") exigir(!p.venda_id, `Este pedido já virou a venda nº ${p.venda_numero ?? ""} no caixa. Cancele a venda no caixa.`);
+			else exigir(status === SEGUINTE[p.status], "Atualize a página: o pedido mudou.");
+			await aplicarStatus(p, status, s.nome, null);
+			return admin["admin.pedido"]({ id });
+		}
+	};
 	const caixa = {
 		"caixa.estado": async () => {
 			const e = await linha("select nome_fantasia, mp_conta, mp_ambiente from empresa where id = 1");
@@ -928,9 +1023,28 @@ function criarLojaNuvem({ db, mp, armazenamento, urls = {} }) {
 			};
 		},
 		/** Recebe do caixa: dados da empresa, textos/pagamentos do site, departamentos e produtos (só os que mudaram). */
-		"caixa.publicar": async ({ empresa, site, categorias, produtos, produtos_ids }) => {
+		"caixa.publicar": async ({ empresa, site, categorias, produtos, produtos_ids, usuarios }) => {
 			await db.transaction(async (t) => {
 				const q = (s, p) => t.query(s, p);
+				if (Array.isArray(usuarios)) {
+					for (const u of usuarios) {
+						if (!txt(u.login) || !/^scrypt\$[0-9a-f]+\$[0-9a-f]+$/.test(u.senha_hash ?? "")) continue;
+						const login = txt(u.login).toLowerCase();
+						const antes = (await q("select senha_hash, ativo from usuarios_web where login = $1", [login])).rows[0];
+						if (antes && (antes.senha_hash !== u.senha_hash || antes.ativo && !u.ativo)) await q("delete from sessoes_web where login = $1", [login]);
+						await q(`insert into usuarios_web (login, nome, papel, senha_hash, ativo) values ($1, $2, $3, $4, $5)
+              on conflict (login) do update set nome = excluded.nome, papel = excluded.papel, senha_hash = excluded.senha_hash, ativo = excluded.ativo, atualizado_em = now()`, [
+							login,
+							txt(u.nome) ?? login,
+							u.papel === "dono" ? "dono" : "funcionario",
+							u.senha_hash,
+							u.ativo !== false
+						]);
+					}
+					const logins = usuarios.map((u) => txt(u.login)?.toLowerCase()).filter(Boolean);
+					await q("delete from sessoes_web where not (login = any($1::text[]))", [logins]);
+					await q("update usuarios_web set ativo = false where not (login = any($1::text[]))", [logins]);
+				}
 				if (empresa) {
 					const cols = COLS_EMPRESA.filter((c) => c in empresa);
 					if (cols.length) await q(`update empresa set ${cols.map((c, i) => `${c} = $${i + 1}`).join(", ")}, atualizado_em = now() where id = 1`, cols.map((c) => empresa[c]));
@@ -1030,29 +1144,7 @@ function criarLojaNuvem({ db, mp, armazenamento, urls = {} }) {
 				venda_id || null,
 				venda_numero ?? null
 			]);
-			if (status && status !== p.status) {
-				exigir([
-					"novo",
-					"confirmado",
-					"separando",
-					"pronto",
-					"entregue",
-					"cancelado"
-				].includes(status), "Situação inválida.");
-				autor = txt(por) ?? "loja";
-				try {
-					if (status === "cancelado") {
-						for (const ant of await linhas(`select * from pagamentos_site where pedido_id = $1 and status = 'aguardando'`, [id])) {
-							if (ant.tipo === "pix" && ant.mp_id) await mp.cancelar(ant.mp_id).catch(() => null);
-							await linhas(`update pagamentos_site set status = 'cancelado' where id = $1`, [ant.id]);
-						}
-						if (p.pagamento_status === "aguardando") await linhas(`update pedidos_site set pagamento_status = 'cancelado' where id = $1`, [id]);
-					}
-					await loja.mudarStatus(p, status, txt(nota) ?? void 0);
-				} finally {
-					autor = "site";
-				}
-			}
+			if (status && status !== p.status) await aplicarStatus(p, status, txt(por) ?? "loja", nota);
 			return pedidoCompleto(await linha("select *, versao::text as versao, numero::int as numero from pedidos_site where id = $1", [id]));
 		},
 		/** Confere no Mercado Pago agora (o dono abriu o pedido no caixa). */
@@ -1113,6 +1205,40 @@ function criarLojaNuvem({ db, mp, armazenamento, urls = {} }) {
 					dados: await caixa[acao](dados ?? {})
 				};
 			}
+			if (acao === "admin.entrar") {
+				await limitar(`entrar:${contexto.ip ?? "?"}`, 10, 15);
+				const login = txt(dados?.login)?.toLowerCase();
+				const u = login && await linha("select login, nome, papel, senha_hash from usuarios_web where login = $1 and ativo", [login]);
+				const ok = u && await conferirSenha(String(dados?.senha ?? ""), u.senha_hash).catch(() => false);
+				exigir(ok, "Usuário ou senha incorretos. Use o mesmo usuário e senha do caixa.");
+				const token = tokenNovo();
+				await linhas(`delete from sessoes_web where expira < now()`);
+				await linhas(`insert into sessoes_web (token_hash, login, expira) values ($1, $2, now() + ($3::int * interval '1 day'))`, [
+					await sha256(token),
+					u.login,
+					SESSAO_DIAS
+				]);
+				return {
+					ok: true,
+					dados: {
+						token,
+						nome: u.nome,
+						papel: u.papel
+					}
+				};
+			}
+			if (admin[acao]) {
+				const s = await sessaoDe(contexto.sessao);
+				if (!s) return {
+					ok: false,
+					erro: "Entre de novo para continuar.",
+					sessaoExpirada: true
+				};
+				return {
+					ok: true,
+					dados: await admin[acao](dados ?? {}, s, contexto.sessao)
+				};
+			}
 			return {
 				ok: false,
 				erro: "Ação desconhecida."
@@ -1138,10 +1264,10 @@ function criarLojaNuvem({ db, mp, armazenamento, urls = {} }) {
 const CORS = {
 	"Access-Control-Allow-Origin": "*",
 	"Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-	"Access-Control-Allow-Headers": "content-type, x-chave-loja, authorization, apikey, x-client-info",
+	"Access-Control-Allow-Headers": "content-type, x-chave-loja, x-sessao-loja, authorization, apikey, x-client-info",
 	"Access-Control-Max-Age": "86400"
 };
-async function responder(loja, { metodo, caminho, consulta, corpoTexto, chave, ip }) {
+async function responder(loja, { metodo, caminho, consulta, corpoTexto, chave, sessao, ip }) {
 	if (metodo === "OPTIONS") return {
 		status: 204,
 		json: null
@@ -1197,6 +1323,7 @@ async function responder(loja, { metodo, caminho, consulta, corpoTexto, chave, i
 		status: 200,
 		json: await loja.tratar(String(corpo.acao ?? ""), corpo.dados ?? {}, {
 			chave,
+			sessao,
 			ip
 		})
 	};
@@ -1246,7 +1373,7 @@ function armazenamentoSupabase({ url, chaveServico, pasta = "midias", enviar = f
 	};
 }
 // nuvem/funcao.js
-function iniciar({ pg, env, servir = globalThis.Deno?.serve }) {
+function iniciar({ pg, env, conferirSenha, servir = globalThis.Deno?.serve }) {
 	const pool = new pg.Pool({
 		connectionString: env("SUPABASE_DB_URL"),
 		max: 3,
@@ -1288,7 +1415,8 @@ function iniciar({ pg, env, servir = globalThis.Deno?.serve }) {
 				urls: {
 					notificacao: `${URL_SUPABASE}/functions/v1/loja/mercadopago`,
 					voltar: siteUrl ? `${siteUrl.replace(/\/$/, "")}/#pedido` : null
-				}
+				},
+				conferirSenha
 			});
 		}
 		return loja;
@@ -1302,6 +1430,7 @@ function iniciar({ pg, env, servir = globalThis.Deno?.serve }) {
 				consulta: u.searchParams,
 				corpoTexto: req.method === "POST" ? await req.text() : "",
 				chave: req.headers.get("x-chave-loja"),
+				sessao: req.headers.get("x-sessao-loja"),
 				ip: req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() ?? req.headers.get("cf-connecting-ip") ?? "?"
 			});
 			return new Response(r.json === null ? null : JSON.stringify(r.json), {
