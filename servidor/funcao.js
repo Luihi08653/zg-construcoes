@@ -972,7 +972,8 @@ const COLS_PRODUTO = [
 	"ativo",
 	"ilustracao",
 	"estoque_atual",
-	"estoque_minimo"
+	"estoque_minimo",
+	"codigo_barras"
 ];
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const EXT = {
@@ -1070,6 +1071,16 @@ function criarLojaNuvem({ db, mp, armazenamento, urls = {}, conferirSenha = asyn
       p.pagamento_modo, p.pagamento_status, p.pagamento, p.troco_para, p.pago_forma, p.pago_parcelas, p.venda_numero,
       (select count(*)::int from pedido_site_itens i where i.pedido_id = p.id) as qtd_itens from pedidos_site p`;
 	const soDono = (s) => exigir(s.papel === "dono", "Só o dono da loja pode ver e mudar isso.");
+	const marcar = (chave) => linhas("insert into estado_web (chave, em) values ($1, now()) on conflict (chave) do update set em = now()", [chave]);
+	/** O caixa confere a fila a cada poucos segundos enquanto o tablet vende: conectado = visto há pouco. */
+	async function estadoCaixa() {
+		const e = await linha(`select em, extract(epoch from now() - em)::int as segundos from estado_web where chave = 'caixa_visto'`);
+		return {
+			visto_em: e?.em ?? null,
+			segundos: e?.segundos ?? null,
+			conectado: !!e && e.segundos <= 90
+		};
+	}
 	const enfileirar = (tipo, dados, por) => linha("insert into alteracoes_web (tipo, dados, por) values ($1, $2::jsonb, $3) returning id, criado_em", [
 		tipo,
 		JSON.stringify(dados),
@@ -1283,7 +1294,105 @@ function criarLojaNuvem({ db, mp, armazenamento, urls = {}, conferirSenha = asyn
 			await linhas(`update site_config set ${CAMPOS_PAGAMENTO.map((c, i) => `${c} = $${i + 1}`).join(", ")}, updated_at = now() where id = 1`, CAMPOS_PAGAMENTO.map((c) => novo[c]));
 			await enfileirar("pagamentos", novo, s.nome);
 			return admin["admin.site"]({}, s);
-		}
+		},
+		"admin.produtosVenda": async () => {
+			await marcar("tablet_ativo");
+			const produtos = await linhas(`select p.id, p.codigo, p.codigo_barras, p.nome, p.marca, p.preco_venda::float8 as preco, p.unidade,
+          p.estoque_atual::float8 as estoque, c.nome as categoria, p.imagem, p.ilustracao
+        from produtos p left join categorias_produto c on c.id = p.categoria_id where p.ativo order by p.nome`);
+			const e = await linha("select permitir_estoque_negativo from empresa where id = 1");
+			return {
+				produtos,
+				caixa: await estadoCaixa(),
+				permitir_negativo: !!e?.permitir_estoque_negativo
+			};
+		},
+		/** Sinal de vida da tela de venda (o caixa passa a conferir a fila a cada poucos segundos). */
+		"admin.tabletAtivo": async () => {
+			await marcar("tablet_ativo");
+			return estadoCaixa();
+		},
+		"admin.vender": async (d, s) => {
+			const c = await estadoCaixa();
+			exigir(c.conectado, "O caixa do computador não está conectado. Abra o programa no computador da loja (com internet) e tente de novo.");
+			exigir(Array.isArray(d.itens) && d.itens.length && d.itens.length <= 200, "Adicione pelo menos um produto.");
+			const ids = d.itens.map((i) => i.produto_id);
+			exigir(ids.every((x) => UUID.test(x ?? "")) && new Set(ids).size === ids.length, "Itens inválidos. Monte o carrinho de novo.");
+			const prods = new Map((await linhas("select id, nome, unidade, preco_venda::float8 as preco from produtos where ativo and id = any($1::uuid[])", [ids])).map((p) => [p.id, p]));
+			exigir(prods.size === ids.length, "Um dos produtos não está mais à venda. Atualize a lista.");
+			const itens = d.itens.map((i) => {
+				const q = Math.round(Number(i.quantidade) * 1e3) / 1e3;
+				exigir(q > 0 && q <= 1e5, `Quantidade inválida em ${prods.get(i.produto_id).nome}.`);
+				const p = prods.get(i.produto_id);
+				return {
+					produto_id: p.id,
+					nome: p.nome,
+					unidade: p.unidade,
+					quantidade: q,
+					preco: p.preco
+				};
+			});
+			const subtotal = r2(itens.reduce((t, i) => t + r2(i.quantidade * i.preco), 0));
+			const desconto = r2(Number(d.desconto) || 0);
+			exigir(desconto >= 0 && desconto < subtotal, "Desconto inválido.");
+			const total = r2(subtotal - desconto);
+			exigir([
+				"dinheiro",
+				"pix",
+				"cartao_credito",
+				"cartao_debito"
+			].includes(d.forma), "Escolha a forma de pagamento.");
+			let recebido = total;
+			if (d.forma === "dinheiro" && d.recebido !== void 0 && d.recebido !== null && d.recebido !== "") {
+				recebido = r2(Number(String(d.recebido).replace(",", ".")));
+				exigir(recebido >= total, "O valor recebido é menor que o total.");
+			}
+			const cpf = digitos(d.cpf);
+			exigir(!cpf || cpf.length === 11 && cpfValido(cpf), "CPF inválido.");
+			const dados = {
+				itens,
+				subtotal,
+				desconto,
+				total,
+				forma: d.forma,
+				recebido,
+				cpf: cpf || null,
+				emitir_nota: d.emitir_nota !== false,
+				imprimir: ["caixa", "tablet"].includes(d.imprimir) ? d.imprimir : "tablet"
+			};
+			const v = await linha("insert into vendas_tablet (login, por, dados) values ($1, $2, $3::jsonb) returning id, criado_em", [
+				s.login,
+				s.nome,
+				JSON.stringify(dados)
+			]);
+			await marcar("tablet_ativo");
+			return {
+				id: v.id,
+				total,
+				troco: r2(recebido - total)
+			};
+		},
+		"admin.venda": async ({ id }) => {
+			exigir(UUID.test(id ?? ""), "Venda inválida.");
+			const v = await linha("select id, criado_em, situacao, resultado, erro, dados from vendas_tablet where id = $1", [id]);
+			exigir(v, "Venda não encontrada.");
+			return {
+				...v,
+				caixa: await estadoCaixa()
+			};
+		},
+		/** Desiste de uma venda que o caixa ainda não pegou. */
+		"admin.cancelarVenda": async ({ id }) => {
+			const r = await linha(`update vendas_tablet set situacao = 'recusada', erro = 'cancelada no tablet antes de chegar ao caixa', processada_em = now()
+        where id = $1 and situacao = 'aguardando' returning id`, [id]);
+			exigir(r, "O caixa já pegou esta venda. Espere o resultado.");
+			return true;
+		},
+		"admin.vendasHoje": async (_d, s) => linhas(`select id, criado_em, situacao, por, erro, (dados->>'total')::float8 as total, dados->>'forma' as forma,
+        resultado->>'venda_numero' as venda_numero, resultado->'nota'->>'status' as nota_status, resultado->'nota'->>'numero' as nota_numero
+      from vendas_tablet where criado_em >= date_trunc('day', now() at time zone 'America/Maceio') at time zone 'America/Maceio'
+        and ($1::boolean or login = $2)
+      order by criado_em desc limit 50`, [s.papel === "dono", s.login])
 	};
 	const caixa = {
 		"caixa.estado": async () => {
@@ -1433,6 +1542,31 @@ function criarLojaNuvem({ db, mp, armazenamento, urls = {}, conferirSenha = asyn
 			exigir(p, "Pedido não encontrado no site.");
 			await loja.conferirPagamento(p);
 			return pedidoCompleto(await linha("select *, versao::text as versao, numero::int as numero from pedidos_site where id = $1", [id]));
+		},
+		/** Vendas do tablet esperando o caixa (já marcadas como "processando"). Vendas paradas há mais de 10 min expiram. */
+		"caixa.vendasTablet": async () => {
+			await marcar("caixa_visto");
+			await linhas(`update vendas_tablet set situacao = 'recusada', erro = 'expirou: o caixa do computador não respondeu em 10 minutos', processada_em = now()
+        where situacao = 'aguardando' and criado_em < now() - interval '10 minutes'`);
+			const vendas = await linhas(`update vendas_tablet set situacao = 'processando' where id in (
+          select id from vendas_tablet where situacao in ('aguardando', 'processando') order by criado_em limit 20)
+        returning id, criado_em, login, por, dados`);
+			vendas.sort((a, b) => new Date(a.criado_em) - new Date(b.criado_em));
+			return {
+				vendas,
+				tablet_ativo_ate: (await linha(`select em + interval '5 minutes' as ate from estado_web where chave = 'tablet_ativo'`))?.ate ?? null
+			};
+		},
+		"caixa.vendaTabletFeita": async ({ id, ok, erro, resultado }) => {
+			exigir(UUID.test(id ?? ""), "Venda inválida.");
+			await linhas(`update vendas_tablet set situacao = $2, erro = $3, resultado = $4::jsonb, processada_em = now() where id = $1 and situacao = 'processando'`, [
+				id,
+				ok ? "registrada" : "recusada",
+				ok ? null : txt(erro)?.slice(0, 400) ?? "recusada pelo caixa",
+				resultado ? JSON.stringify(resultado) : null
+			]);
+			await linhas(`delete from vendas_tablet where criado_em < now() - interval '30 days'`);
+			return true;
 		},
 		/** O que a dona mudou pelo site e o caixa ainda não aplicou (na ordem em que foi feito). */
 		"caixa.alteracoes": async ({ limite = 100 } = {}) => linhas(`select id, criado_em, por, tipo, dados from alteracoes_web where situacao = 'pendente'
